@@ -20,7 +20,8 @@ function formatUsd(n: number): string {
 function createTextSprite(
   T: ThreeModule,
   text: string,
-  color: THREE_NS.Color
+  color: THREE_NS.Color,
+  sizeFactor: number = 1,
 ): { sprite: THREE_NS.Sprite; material: THREE_NS.SpriteMaterial; texture: THREE_NS.CanvasTexture } {
   const canvas = document.createElement("canvas");
   canvas.width = 512;
@@ -55,7 +56,9 @@ function createTextSprite(
   });
 
   const sprite = new T.Sprite(material);
-  sprite.scale.set(18, 4.5, 1);
+  const baseW = 18;
+  const baseH = 4.5;
+  sprite.scale.set(baseW * sizeFactor, baseH * sizeFactor, 1);
 
   return { sprite, material, texture };
 }
@@ -75,6 +78,7 @@ interface GlobeProps {
   paused?: boolean;
   spawnInterval?: number;
   onSpawnProgress?: (index: number, total: number) => void;
+  seekTo?: number | null;
 }
 
 // ── Custom Arc Types ──
@@ -138,6 +142,8 @@ interface OnionLayer {
 interface PeelState {
   active: boolean;
   startTime: number;
+  mode: "open" | "close";       // open = peel away, close = wrap back
+  onCloseComplete?: () => void;  // callback when close finishes
 }
 
 // ── Dot Constants ──
@@ -264,7 +270,69 @@ function createArcPath(
   return allPoints;
 }
 
-export default function Globe({ arcs, onArcHover, loop = true, paused = false, spawnInterval: spawnIntervalMs = 400, onSpawnProgress }: GlobeProps) {
+// ── Cash register "ka-ching" sound effect ──
+let audioCtx: AudioContext | null = null;
+let kachingBuffer: AudioBuffer | null = null;
+let audioUnlocked = false;
+
+function getAudioCtx(): AudioContext {
+  if (!audioCtx) audioCtx = new AudioContext();
+  return audioCtx;
+}
+
+function unlockAudio() {
+  if (audioUnlocked) return;
+  audioUnlocked = true;
+  const ctx = getAudioCtx();
+  if (ctx.state === "suspended") ctx.resume();
+  loadKachingBuffer();
+  document.removeEventListener("click", unlockAudio);
+  document.removeEventListener("keydown", unlockAudio);
+  document.removeEventListener("pointerdown", unlockAudio);
+}
+
+if (typeof document !== "undefined") {
+  document.addEventListener("click", unlockAudio);
+  document.addEventListener("keydown", unlockAudio);
+  document.addEventListener("pointerdown", unlockAudio);
+}
+
+let kachingRawBuf: ArrayBuffer | null = null;
+
+async function prefetchKaching() {
+  if (kachingRawBuf) return;
+  const resp = await fetch("/kaching.mp3");
+  kachingRawBuf = await resp.arrayBuffer();
+}
+
+async function loadKachingBuffer() {
+  if (kachingBuffer) return;
+  if (!kachingRawBuf) await prefetchKaching();
+  const ctx = getAudioCtx();
+  kachingBuffer = await ctx.decodeAudioData(kachingRawBuf!.slice(0));
+}
+
+// Pre-fetch MP3 bytes immediately on module load (no AudioContext needed)
+if (typeof window !== "undefined") {
+  prefetchKaching();
+}
+
+function playKaching(volume: number = 0.15) {
+  const ctx = getAudioCtx();
+  if (!kachingBuffer) {
+    loadKachingBuffer().then(() => playKaching(volume));
+    return;
+  }
+  const source = ctx.createBufferSource();
+  source.buffer = kachingBuffer;
+  const gain = ctx.createGain();
+  gain.gain.value = volume;
+  source.connect(gain);
+  gain.connect(ctx.destination);
+  source.start(0, 0.2);
+}
+
+export default function Globe({ arcs, onArcHover, loop = true, paused = false, spawnInterval: spawnIntervalMs = 400, onSpawnProgress, seekTo }: GlobeProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const globeRef = useRef<GlobeInstance>(null);
   const dotMeshRef = useRef<THREE_NS.InstancedMesh | null>(null);
@@ -276,6 +344,8 @@ export default function Globe({ arcs, onArcHover, loop = true, paused = false, s
   const animFrameRef = useRef<number>(0);
   const spawnIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const spawnIdxRef = useRef<number>(0);
+  const arcsRef = useRef(arcs);
+  arcsRef.current = arcs;
   // Per-dot glow state for impact flash effect
   const dotBaseColorsRef = useRef<Float32Array | null>(null);
   const dotGlowIntensityRef = useRef<Float32Array | null>(null);
@@ -329,7 +399,7 @@ export default function Globe({ arcs, onArcHover, loop = true, paused = false, s
       globe.controls().enableZoom = true;
       globe.controls().minDistance = 200;
       globe.controls().maxDistance = 500;
-      globe.pointOfView({ lat: 20, lng: 0, altitude: 2.5 });
+      globe.pointOfView({ lat: 35, lng: -95, altitude: 2.5 });
 
       globeRef.current = globe;
 
@@ -378,6 +448,22 @@ export default function Globe({ arcs, onArcHover, loop = true, paused = false, s
       // ── Create onion shell layers ──
       onionLayersRef.current = createOnionLayers(THREE, globeGroupRef.current);
 
+      // If arcs are already available (cached data arrived before init),
+      // trigger peel immediately. Use ref to get latest arcs value
+      // since the closure captures the initial (possibly empty) array.
+      const currentArcs = arcsRef.current;
+      if (currentArcs.length > 0) {
+        firstDataArrivalRef.current = true;
+        hadVisibleArcsRef.current = true;
+        updateDotColors(THREE);
+        triggerPeel(300, "open");
+        setTimeout(() => {
+          spawnIdxRef.current = 0;
+          onSpawnProgress?.(0, currentArcs.length);
+          if (!paused) startSpawnInterval();
+        }, 300);
+      }
+
       // Initialize per-dot glow arrays
       dotBaseColorsRef.current = new Float32Array(count * 3);
       dotGlowIntensityRef.current = new Float32Array(count); // all 0
@@ -418,73 +504,100 @@ export default function Globe({ arcs, onArcHover, loop = true, paused = false, s
           }
         }
 
-        // ── Onion peel animation (bottom-up, per-half stagger) ──
+        // ── Onion peel animation (open = peel away, close = wrap back) ──
         if (onionLayers && peelState?.active) {
           const elapsed = nowSec - peelState.startTime;
-          const peelDuration = 1.0;
+          const isClosing = peelState.mode === "close";
+          const peelDuration = isClosing ? 0.6 : 1.0;
           let allDone = true;
 
-          // Flatten all halves across all layers
           for (const layer of onionLayers) {
-            // Track max progress across both halves to fade seam lines
-            let layerMaxE = 0;
+            let layerMaxPeel = 0;
 
             for (const half of layer.halves) {
-              const halfElapsed = elapsed - half.peelDelay;
+              const halfDelay = isClosing ? (half.peelDelay * 0.5) : half.peelDelay;
+              const halfElapsed = elapsed - halfDelay;
 
               if (halfElapsed < 0) {
-                // Not started yet — keep breathing on this layer
-                const layerOffset = layer.layerIndex * 2.1;
-                const s = 1 + 0.025 * Math.sin(nowSec * 2.0 + layerOffset);
-                layer.group.scale.set(s, s, s);
+                if (isClosing) {
+                  // Not started closing yet — hold at fully peeled
+                  half.pivot.rotation.x = -(150 * DEG2RAD);
+                  half.material.opacity = 0;
+                  layerMaxPeel = Math.max(layerMaxPeel, 1);
+                } else {
+                  const layerOffset = layer.layerIndex * 2.1;
+                  const s = 1 + 0.025 * Math.sin(nowSec * 2.0 + layerOffset);
+                  layer.group.scale.set(s, s, s);
+                }
                 allDone = false;
                 continue;
               }
 
               const t = Math.min(1, halfElapsed / peelDuration);
-              // easeOutCubic
-              const e = 1 - Math.pow(1 - t, 3);
-
               if (t < 1) allDone = false;
-              layerMaxE = Math.max(layerMaxE, e);
 
-              // Pivot X rotation: swing shell up from bottom (0 → -150°)
-              half.pivot.rotation.x = -(150 * DEG2RAD) * e;
+              // peelProgress: 0 = closed (wrapped), 1 = fully peeled away
+              let peelProgress: number;
+              if (isClosing) {
+                // t: 0→1, peelProgress: 1→0 (peeled → closed), easeOutCubic
+                peelProgress = Math.pow(1 - t, 3);
+              } else {
+                // t: 0→1, peelProgress: 0→1 (closed → peeled), easeOutCubic
+                peelProgress = 1 - Math.pow(1 - t, 3);
+              }
 
-              // Radial push: translate pivot outward from globe center
+              layerMaxPeel = Math.max(layerMaxPeel, peelProgress);
+
+              half.pivot.rotation.x = -(150 * DEG2RAD) * peelProgress;
+
               const pushDir = half.pivot.position.clone().normalize();
-              const pushAmount = GLOBE_RADIUS * 0.15 * e;
+              const pushAmount = GLOBE_RADIUS * 0.15 * peelProgress;
               half.pivot.position.set(0, -layer.radius, 0);
               half.pivot.position.addScaledVector(pushDir, pushAmount);
 
-              // Fade out
-              half.material.opacity = layer.baseOpacity * (1 - e);
+              half.material.opacity = layer.baseOpacity * (1 - peelProgress);
             }
 
-            // Fade seam lines with the layer
             for (const seam of layer.seamLines) {
-              seam.material.opacity = layer.baseOpacity * 1.5 * (1 - layerMaxE);
+              seam.material.opacity = layer.baseOpacity * 1.5 * (1 - layerMaxPeel);
             }
           }
 
-          // Cleanup when all halves done
           if (allDone) {
-            for (const layer of onionLayers) {
-              for (const half of layer.halves) {
-                half.geometry.dispose();
-                half.material.dispose();
-                half.pivot.remove(half.mesh);
-                layer.group.remove(half.pivot);
+            if (isClosing) {
+              // Close complete — reset all halves to closed position
+              for (const layer of onionLayers) {
+                layer.group.scale.set(1, 1, 1);
+                for (const half of layer.halves) {
+                  half.pivot.rotation.x = 0;
+                  half.pivot.position.set(0, -layer.radius, 0);
+                  half.material.opacity = layer.baseOpacity;
+                }
+                for (const seam of layer.seamLines) {
+                  seam.material.opacity = layer.baseOpacity * 1.5;
+                }
               }
-              for (const seam of layer.seamLines) {
-                seam.line.geometry.dispose();
-                seam.material.dispose();
-                layer.group.remove(seam.line);
+              peelStateRef.current = null;
+              peelState.onCloseComplete?.();
+            } else {
+              // Open complete — dispose shells
+              for (const layer of onionLayers) {
+                for (const half of layer.halves) {
+                  half.geometry.dispose();
+                  half.material.dispose();
+                  half.pivot.remove(half.mesh);
+                  layer.group.remove(half.pivot);
+                }
+                for (const seam of layer.seamLines) {
+                  seam.line.geometry.dispose();
+                  seam.material.dispose();
+                  layer.group.remove(seam.line);
+                }
+                group.remove(layer.group);
               }
-              group.remove(layer.group);
+              onionLayersRef.current = null;
+              peelStateRef.current = null;
             }
-            onionLayersRef.current = null;
-            peelStateRef.current = null;
           }
         }
 
@@ -509,10 +622,29 @@ export default function Globe({ arcs, onArcHover, loop = true, paused = false, s
               // Flash nearby land dots in the arc's token color
               triggerDotGlow(arc.arcData.endLat, arc.arcData.endLng, arc.color);
 
-              // Create floating text label at impact point
+              // Play kaching if impact is on the visible side of the globe
+              // Volume scales with both visibility angle and transfer value
+              const cam = globeRef.current?.camera?.();
+              if (cam) {
+                const impactNormal = arc.destinationPoint.clone().normalize();
+                const camDir = cam.position.clone().normalize();
+                const dot = impactNormal.dot(camDir);
+                if (dot > 0.15) {
+                  const usdVal = Math.max(arc.arcData.totalUsd, 1);
+                  // Log-scale: $10K→0.6x, $100K→1.0x, $1M→1.4x, $10M→1.8x
+                  const valueMult = 0.2 + 0.4 * Math.max(0, Math.log10(usdVal) - 4);
+                  const vol = (0.08 + 0.07 * dot) * valueMult;
+                  playKaching(vol);
+                }
+              }
+
+              // Create floating text label at impact point, sized by transaction value
               const toFlag = COUNTRY_FLAGS[arc.arcData.toCountry] ?? "";
               const label = `${toFlag} +${formatUsd(arc.arcData.totalUsd)} ${arc.arcData.tokenSymbol}`;
-              const { sprite, material: spriteMat, texture: spriteTex } = createTextSprite(T, label, arc.color);
+              // Log-scale sizing: $10K → 1.5x, $100K → 1.95x, $1M → 2.4x, $10M → 2.85x, $100M → 3.3x
+              const usd = Math.max(arc.arcData.totalUsd, 1);
+              const sizeFactor = 1.5 + 0.45 * Math.max(0, Math.log10(usd) - 4);
+              const { sprite, material: spriteMat, texture: spriteTex } = createTextSprite(T, label, arc.color, sizeFactor);
               const normal = arc.destinationPoint.clone().normalize();
               sprite.position.copy(arc.destinationPoint).addScaledVector(normal, 0.5 * S);
               group.add(sprite);
@@ -720,23 +852,7 @@ export default function Globe({ arcs, onArcHover, loop = true, paused = false, s
       liveArcsRef.current = [];
       impactEffectsRef.current = [];
       // Clean up onion shells
-      if (onionLayersRef.current && group) {
-        for (const layer of onionLayersRef.current) {
-          for (const half of layer.halves) {
-            half.geometry.dispose();
-            half.material.dispose();
-            half.pivot.remove(half.mesh);
-            layer.group.remove(half.pivot);
-          }
-          for (const seam of layer.seamLines) {
-            seam.line.geometry.dispose();
-            seam.material.dispose();
-            layer.group.remove(seam.line);
-          }
-          group.remove(layer.group);
-        }
-        onionLayersRef.current = null;
-      }
+      cleanupOnionLayers();
       if (dotMeshRef.current) {
         dotMeshRef.current.geometry.dispose();
         (dotMeshRef.current.material as THREE_NS.MeshBasicMaterial).dispose();
@@ -751,16 +867,19 @@ export default function Globe({ arcs, onArcHover, loop = true, paused = false, s
   }, []);
 
   // ── Helper: spawn a single arc at spawnIdxRef.current ──
+  // Uses arcsRef.current so it always reads the latest arcs,
+  // even when called from an interval created during init.
   function spawnOneArc() {
     const T = threeRef.current;
     const g = globeGroupRef.current;
-    if (!T || !g || arcs.length === 0) return;
+    const currentArcs = arcsRef.current;
+    if (!T || !g || currentArcs.length === 0) return;
     if (liveArcsRef.current.length >= MAX_CONCURRENT_ARCS) return;
 
     const idx = spawnIdxRef.current;
 
     // In non-loop mode, stop after all arcs have been spawned
-    if (!loop && idx >= arcs.length) {
+    if (!loop && idx >= currentArcs.length) {
       if (spawnIntervalRef.current) {
         clearInterval(spawnIntervalRef.current);
         spawnIntervalRef.current = null;
@@ -768,11 +887,11 @@ export default function Globe({ arcs, onArcHover, loop = true, paused = false, s
       return;
     }
 
-    const arcData = arcs[idx % arcs.length];
+    const arcData = currentArcs[idx % currentArcs.length];
     spawnIdxRef.current = idx + 1;
 
     // Report progress
-    onSpawnProgress?.(Math.min(idx + 1, arcs.length), arcs.length);
+    onSpawnProgress?.(Math.min(idx + 1, currentArcs.length), currentArcs.length);
 
     const startPos = latLngToVec3(T, arcData.startLat, arcData.startLng);
     const endPos = latLngToVec3(T, arcData.endLat, arcData.endLng);
@@ -819,47 +938,144 @@ export default function Globe({ arcs, onArcHover, loop = true, paused = false, s
     spawnIntervalRef.current = setInterval(spawnOneArc, spawnIntervalMs);
   }
 
-  // ── Spawn custom arcs when data arrives ──
-  useEffect(() => {
-    const THREE = threeRef.current;
-    const group = globeGroupRef.current;
-    if (!THREE || !group || arcs.length === 0) return;
-
-    // Trigger onion peel on first data arrival
-    if (!firstDataArrivalRef.current && arcs.length > 0) {
-      firstDataArrivalRef.current = true;
-      setTimeout(() => {
-        if (onionLayersRef.current) {
-          peelStateRef.current = {
-            active: true,
-            startTime: performance.now() / 1000,
-          };
+  // Helper to clean up onion layers
+  function cleanupOnionLayers() {
+    if (onionLayersRef.current) {
+      for (const layer of onionLayersRef.current) {
+        for (const half of layer.halves) {
+          half.geometry.dispose();
+          half.material.dispose();
+          half.pivot.remove(half.mesh);
+          layer.group.remove(half.pivot);
         }
-      }, 300);
+        for (const seam of layer.seamLines) {
+          seam.line.geometry.dispose();
+          seam.material.dispose();
+          layer.group.remove(seam.line);
+        }
+        layer.group.parent?.remove(layer.group);
+      }
+      onionLayersRef.current = null;
+      peelStateRef.current = null;
     }
+  }
 
-    // Update dot colors
-    updateDotColors(THREE);
+  // Helper to trigger onion peel after delay
+  function triggerPeel(delayMs: number, mode: "open" | "close" = "open", onComplete?: () => void) {
+    setTimeout(() => {
+      if (onionLayersRef.current) {
+        peelStateRef.current = {
+          active: true,
+          startTime: performance.now() / 1000,
+          mode,
+          onCloseComplete: onComplete,
+        };
+      }
+    }, delayMs);
+  }
 
-    // Clear any previous spawn loop
-    if (spawnIntervalRef.current) clearInterval(spawnIntervalRef.current);
+  // Track whether there were previously visible arcs (to know if we need close animation)
+  const hadVisibleArcsRef = useRef(false);
+  const pendingPeelRef = useRef(false);
 
-    // Remove existing live arcs
+  // Helper to clear live arcs and impact effects from the scene
+  function clearLiveArcs() {
+    const group = globeGroupRef.current;
+    if (!group) return;
+    if (spawnIntervalRef.current) {
+      clearInterval(spawnIntervalRef.current);
+      spawnIntervalRef.current = null;
+    }
     for (const arc of liveArcsRef.current) {
       group.remove(arc.mesh);
       arc.mesh.geometry.dispose();
       arc.material.dispose();
     }
     liveArcsRef.current = [];
-
-    // Reset spawn index
-    spawnIdxRef.current = 0;
-    onSpawnProgress?.(0, arcs.length);
-
-    // Start spawning (unless paused)
-    if (!paused) {
-      startSpawnInterval();
+    for (const fx of impactEffectsRef.current) {
+      group.remove(fx.ring);
+      group.remove(fx.outerRing);
+      group.remove(fx.centerDot);
+      if (fx.textSprite) {
+        group.remove(fx.textSprite);
+        fx.textMaterial?.dispose();
+        fx.textTexture?.dispose();
+      }
     }
+    impactEffectsRef.current = [];
+    spawnIdxRef.current = 0;
+  }
+
+  // Helper to start the open peel + spawn
+  function beginOpenPeel(delay: number) {
+    const THREE = threeRef.current;
+    if (!THREE) return;
+    updateDotColors(THREE);
+    triggerPeel(delay, "open");
+    setTimeout(() => {
+      if (!paused) startSpawnInterval();
+    }, delay);
+  }
+
+  // ── React to arcs changes (view switch, new data, preset change) ──
+  useEffect(() => {
+    const THREE = threeRef.current;
+    const group = globeGroupRef.current;
+    if (!THREE || !group) {
+      // Three.js not ready yet — init effect will handle arcs if present
+      return;
+    }
+
+    const hadArcs = hadVisibleArcsRef.current;
+
+    if (hadArcs && !onionLayersRef.current) {
+      // There were visible arcs and no onion — play close animation first
+      // Clear arcs immediately so nothing stays frozen on screen
+      clearLiveArcs();
+      onSpawnProgress?.(0, arcs.length);
+
+      // Create shells starting in peeled-open position
+      onionLayersRef.current = createOnionLayers(THREE, group);
+
+      // Set halves to fully peeled state so close animation starts from there
+      for (const layer of onionLayersRef.current) {
+        for (const half of layer.halves) {
+          half.pivot.rotation.x = -(150 * DEG2RAD);
+          half.material.opacity = 0;
+        }
+        for (const seam of layer.seamLines) {
+          seam.material.opacity = 0;
+        }
+      }
+
+      // Start close animation immediately
+      triggerPeel(0, "close", () => {
+        if (arcs.length > 0) {
+          pendingPeelRef.current = false;
+          beginOpenPeel(100);
+        } else {
+          pendingPeelRef.current = true;
+        }
+      });
+    } else {
+      // No previous arcs or onion already exists — go straight to closed + open
+      cleanupOnionLayers();
+      clearLiveArcs();
+      onSpawnProgress?.(0, arcs.length);
+
+      onionLayersRef.current = createOnionLayers(THREE, group);
+
+      if (arcs.length > 0) {
+        const delay = firstDataArrivalRef.current ? 200 : 400;
+        firstDataArrivalRef.current = true;
+        pendingPeelRef.current = false;
+        beginOpenPeel(delay);
+      } else {
+        pendingPeelRef.current = true;
+      }
+    }
+
+    hadVisibleArcsRef.current = arcs.length > 0;
 
     return () => {
       if (spawnIntervalRef.current) {
@@ -867,8 +1083,30 @@ export default function Globe({ arcs, onArcHover, loop = true, paused = false, s
         spawnIntervalRef.current = null;
       }
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [arcs]);
+
+  // ── Handle deferred peel when arcs populate after being empty ──
+  const prevArcsLenRef = useRef(arcs.length);
+  useEffect(() => {
+    const wasEmpty = prevArcsLenRef.current === 0;
+    prevArcsLenRef.current = arcs.length;
+
+    if (!wasEmpty || arcs.length === 0 || !pendingPeelRef.current) return;
+
+    const THREE = threeRef.current;
+    if (!THREE) return;
+
+    // Data just arrived while onion was waiting closed
+    pendingPeelRef.current = false;
+    firstDataArrivalRef.current = true;
+    hadVisibleArcsRef.current = true;
+    beginOpenPeel(200);
+
+    spawnIdxRef.current = 0;
+    onSpawnProgress?.(0, arcs.length);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [arcs, spawnIntervalMs, loop]);
+  }, [arcs]);
 
   // ── Pause / resume effect ──
   useEffect(() => {
@@ -891,6 +1129,46 @@ export default function Globe({ arcs, onArcHover, loop = true, paused = false, s
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paused]);
 
+  // ── Seek effect ──
+  useEffect(() => {
+    if (seekTo == null || arcs.length === 0) return;
+    const group = globeGroupRef.current;
+    if (!group) return;
+
+    // Stop current spawning
+    if (spawnIntervalRef.current) {
+      clearInterval(spawnIntervalRef.current);
+      spawnIntervalRef.current = null;
+    }
+
+    // Remove all live arcs and impacts
+    for (const arc of liveArcsRef.current) {
+      group.remove(arc.mesh);
+      arc.mesh.geometry.dispose();
+      arc.material.dispose();
+    }
+    liveArcsRef.current = [];
+    for (const fx of impactEffectsRef.current) {
+      group.remove(fx.ring);
+      group.remove(fx.outerRing);
+      group.remove(fx.centerDot);
+      if (fx.textSprite) {
+        group.remove(fx.textSprite);
+        fx.textMaterial?.dispose();
+        fx.textTexture?.dispose();
+      }
+    }
+    impactEffectsRef.current = [];
+
+    // Set new spawn position and resume
+    spawnIdxRef.current = seekTo;
+    onSpawnProgress?.(seekTo, arcs.length);
+    if (!paused) {
+      startSpawnInterval();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seekTo]);
+
   // ── Resize ──
   useEffect(() => {
     function handleResize() {
@@ -907,9 +1185,9 @@ export default function Globe({ arcs, onArcHover, loop = true, paused = false, s
   // ── Helper: create onion shell layers around the globe ──
   function createOnionLayers(T: ThreeModule, group: THREE_NS.Object3D): OnionLayer[] {
     const layerConfigs = [
-      { radiusMult: 1.04, color: "#b89860", opacity: 0.35 },
-      { radiusMult: 1.09, color: "#c4a878", opacity: 0.28 },
-      { radiusMult: 1.15, color: "#d4c4a0", opacity: 0.20 },
+      { radiusMult: 1.04, color: "#b89860", opacity: 0.65 },
+      { radiusMult: 1.09, color: "#c4a878", opacity: 0.50 },
+      { radiusMult: 1.15, color: "#d4c4a0", opacity: 0.38 },
     ];
     const yRotations = [0, Math.PI / 3, (2 * Math.PI) / 3]; // 0°, 60°, 120°
     const layers: OnionLayer[] = [];

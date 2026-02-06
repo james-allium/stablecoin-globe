@@ -10,6 +10,10 @@ out/
 .env.local
 .env.*.local
 
+# cloudflare
+.open-next/
+.wrangler/
+
 # misc
 .DS_Store
 *.tsbuildinfo

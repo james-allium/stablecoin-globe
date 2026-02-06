@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { runQueryAndWait } from "@/lib/allium";
+import { cfCacheMatch, cfCachePut, dedup } from "@/lib/cache";
 import type {
   EntityLabel,
   EnrichedCounterparty,
@@ -26,13 +27,25 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "Missing address parameter" }, { status: 400 });
   }
 
+  const cacheUrl = `https://cache.internal/api/wallet?address=${address.toLowerCase()}&chain=${chain}`;
+
+  // Check CF edge cache for the fully processed response
+  const cached = await cfCacheMatch(cacheUrl);
+  if (cached) {
+    console.log(`[wallet] CF cache hit`);
+    return NextResponse.json(cached, {
+      headers: { "Cache-Control": "public, s-maxage=3600, stale-while-revalidate=7200" },
+    });
+  }
+
   try {
     console.log(`[wallet] Querying labeled counterparties for ${address} on ${chain}...`);
-    const result = await runQueryAndWait(
-      WALLET_QUERY_ID,
-      apiKey,
-      60000,
-      { wallet_address: address.toLowerCase(), chain }
+    const walletKey = `wallet:${address.toLowerCase()}:${chain}`;
+    const result = await dedup(walletKey, () =>
+      runQueryAndWait(WALLET_QUERY_ID, apiKey, 60000, {
+        wallet_address: address.toLowerCase(),
+        chain,
+      })
     );
 
     const rows = result?.data || result || [];
@@ -116,7 +129,13 @@ export async function GET(request: NextRequest) {
       counterparties,
     };
 
-    return NextResponse.json(response);
+    await cfCachePut(cacheUrl, response, 3600);
+
+    return NextResponse.json(response, {
+      headers: {
+        "Cache-Control": "public, s-maxage=3600, stale-while-revalidate=7200",
+      },
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
     console.error("[wallet] Error:", message);

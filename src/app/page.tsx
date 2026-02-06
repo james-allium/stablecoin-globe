@@ -123,10 +123,13 @@ function walletDataToArcs(data: WalletData): ArcData[] {
 }
 
 function makeDefaultStablecoinDateRange(): DateRange {
+  // Snap to current hour boundary so cache key stays stable
   const now = new Date();
+  const end = new Date(Math.floor(now.getTime() / (3600 * 1000)) * 3600 * 1000);
+  const start = new Date(end.getTime() - 24 * 3600 * 1000);
   return {
-    startDate: new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString().replace("T", " ").slice(0, 19),
-    endDate: now.toISOString().replace("T", " ").slice(0, 19),
+    startDate: start.toISOString().replace("T", " ").slice(0, 19),
+    endDate: end.toISOString().replace("T", " ").slice(0, 19),
   };
 }
 
@@ -146,6 +149,7 @@ export default function Home() {
   const [timelinePlaying, setTimelinePlaying] = useState(true);
   const [timelineProgress, setTimelineProgress] = useState<{ index: number; total: number }>({ index: 0, total: 0 });
   const [timelineSpeed, setTimelineSpeed] = useState<1 | 2 | 5>(1);
+  const [seekTo, setSeekTo] = useState<number | null>(null);
   const walletArcsRef = useRef<ArcData[]>([]);
 
   // Date range state
@@ -182,6 +186,14 @@ export default function Home() {
 
   const handleTimelineSpeedChange = useCallback((speed: 1 | 2 | 5) => {
     setTimelineSpeed(speed);
+  }, []);
+
+  const handleTimelineSeek = useCallback((index: number) => {
+    setSeekTo(index);
+    setSpawnIndex(index);
+    setTimelineProgress((prev) => ({ ...prev, index }));
+    // Clear seekTo after a tick so the same value can be sought again
+    requestAnimationFrame(() => setSeekTo(null));
   }, []);
 
   const fetchWallet = useCallback(async (address: string, chain: string) => {
@@ -252,9 +264,12 @@ export default function Home() {
     fetchFlows(range);
   }, [fetchFlows]);
 
-  // Fetch stablecoin data on mount
+  // Fetch stablecoin and default wallet data on mount
   useEffect(() => {
+    // Fire-and-forget: warm server cache for default queries
+    fetch("/api/prefetch").catch(() => {});
     fetchFlows();
+    fetchWallet("0xdbf5e9c5206d0db70a90108bf936da60221dc080", "ethereum");
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const activeArcs =
@@ -273,6 +288,11 @@ export default function Home() {
     <div className="flex h-screen w-screen bg-[#f5f0e8]">
       {/* Globe takes remaining space */}
       <div className="flex-1 relative min-w-0 overflow-hidden">
+        {/* Allium logo */}
+        <a href="https://allium.so" target="_blank" rel="noopener noreferrer" className="absolute top-5 left-5 z-10">
+          <img src="/allium-logo.avif" alt="Allium" className="h-6 opacity-70 hover:opacity-100 transition-opacity" />
+        </a>
+
         <Globe
           arcs={activeArcs}
           onArcHover={handleArcHover}
@@ -280,6 +300,7 @@ export default function Home() {
           paused={activeView === "wallet" ? !timelinePlaying : false}
           spawnInterval={activeView === "wallet" ? derivedSpawnInterval : 400}
           onSpawnProgress={handleSpawnProgress}
+          seekTo={activeView === "wallet" ? seekTo : null}
         />
 
         {/* Loading text (no blur — onion shells provide visual loading state) */}
@@ -314,6 +335,7 @@ export default function Home() {
         onTimelinePlayPause={handleTimelinePlayPause}
         onTimelineRestart={handleTimelineRestart}
         onTimelineSpeedChange={handleTimelineSpeedChange}
+        onTimelineSeek={handleTimelineSeek}
         stablecoinDateRange={stablecoinDateRange}
         stablecoinIsLive={stablecoinIsLive}
         onStablecoinDateRangeChange={handleStablecoinDateRangeChange}

@@ -1,5 +1,11 @@
 import type { Metadata } from "next";
+import { Space_Grotesk } from "next/font/google";
 import "./globals.css";
+
+const spaceGrotesk = Space_Grotesk({
+  subsets: ["latin"],
+  variable: "--font-space",
+});
 
 export const metadata: Metadata = {
   title: "Follow the Money — Stablecoin Globe",
@@ -12,7 +18,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en">
+    <html lang="en" className={spaceGrotesk.variable}>
       <body className="antialiased">{children}</body>
     </html>
   );

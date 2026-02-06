@@ -17,7 +17,7 @@ body {
   overflow: hidden;
   background: #000;
   color: #fff;
-  font-family: system-ui, -apple-system, sans-serif;
+  font-family: var(--font-space), system-ui, -apple-system, sans-serif;
 }
 
 /* Scrollbar styling */
